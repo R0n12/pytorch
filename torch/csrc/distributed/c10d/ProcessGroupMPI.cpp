@@ -691,18 +691,16 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::scatter(
   }
 }
 
-c10::intrusive_ptr<ProcessGroup::Work> ProcessGroupMPI::reduce_scatter(
+c10::intrusive_ptr<Work> ProcessGroupMPI::reduce_scatter(
     std::vector<at::Tensor>& outputTensors,
     std::vector<std::vector<at::Tensor>>& inputTensors,
     const ReduceScatterOptions& opts) {
-  //TORCH_CHECK(false, "ProcessGroupMPI does not support reduce_scatter");
 
-  std::function<void(std::unique_ptr<WorkEntry>&)> runFunc =
+    std::function<void(std::unique_ptr<WorkEntry>&)> runFunc =
       [opts, this](std::unique_ptr<WorkEntry>& entry) {
         auto data = (entry->dst)[0];
         void* sendbuf = nullptr;
         at::Tensor flatInputTensor;
-
         std::vector<at::Tensor>& inputDataVec = entry->src;
         flatInputTensor = newLikeFlat(inputDataVec);
         sendbuf = flatInputTensor.data_ptr();
@@ -710,10 +708,8 @@ c10::intrusive_ptr<ProcessGroup::Work> ProcessGroupMPI::reduce_scatter(
         for (const auto i : c10::irange(inputDataVec.size())) {
           flatInputTensor[i].copy_(inputDataVec.at(i));
         }
-
         int recvcounts[size_];
         std::fill_n(recvcounts, size_, flatInputTensor.numel()/(size_));
-
         c10::DeviceGuard guard(data.device());
         std::unique_lock<std::mutex> globalLock(pgGlobalMutex_);
         MPI_CHECK(MPI_Reduce_scatter(
@@ -724,15 +720,56 @@ c10::intrusive_ptr<ProcessGroup::Work> ProcessGroupMPI::reduce_scatter(
             mpiOp.at(opts.reduceOp),
             pgComm_));
       };
+    auto entry = std::make_unique<WorkEntry>(
+        &inputTensors[0], &outputTensors, std::move(runFunc));
+    return enqueue(
+        std::move(entry),
+        "mpi:reduce_scatter",
+        inputTensors.size() > 0
+            ? std::optional<std::vector<at::Tensor>>(inputTensors[0])
+            : std::nullopt);
+}
 
-  auto entry = std::make_unique<WorkEntry>(
-      &inputTensors[0], &outputTensors, std::move(runFunc));
-  return enqueue(
-      std::move(entry),
-      "mpi:reduce-scatter",
-      inputTensors.size() > 0
-          ? c10::optional<std::vector<at::Tensor>>(inputTensors[0])
-          : c10::nullopt);
+c10::intrusive_ptr<Work> ProcessGroupMPI::_reduce_scatter_base(
+    at::Tensor& outputTensor,
+    at::Tensor& inputTensor,
+    const ReduceScatterOptions& opts) {
+
+    checkSingleTensorHelper(inputTensor);
+    checkSingleTensorHelper(outputTensor);
+
+    std::function<void(std::unique_ptr<WorkEntry>&)> runFunc =
+      [opts, this](std::unique_ptr<WorkEntry>& entry) {
+        auto data = (entry->dst)[0];
+        auto srcdata = (entry->src)[0];
+        void* sendbuf = nullptr;
+
+        // Input tensor is already flat, so directly use it
+        sendbuf = (entry->src)[0].data_ptr();
+        int recvcounts[size_];
+        const int sendcount = (entry -> src)[0].numel() / (size_);
+        std::fill_n(recvcounts, size_, sendcount);
+        c10::DeviceGuard guard(data.device());
+        std::unique_lock<std::mutex> globalLock(pgGlobalMutex_);
+
+        MPI_CHECK(MPI_Reduce_scatter(
+            sendbuf,
+            data.data_ptr(),
+            recvcounts,
+            mpiDatatype.at(srcdata.scalar_type()),
+            mpiOp.at(opts.reduceOp),
+            pgComm_));
+      };
+
+    std::vector<at::Tensor> inputTensors = {inputTensor};
+    std::vector<at::Tensor> outputTensors = {outputTensor};
+    auto entry = std::make_unique<WorkEntry>(
+        &inputTensors, &outputTensors, std::move(runFunc));
+
+    return enqueue(
+        std::move(entry),
+        "mpi:_reduce_scatter_base",
+        std::optional<std::vector<at::Tensor>>(inputTensors));
 }
 
 c10::intrusive_ptr<Work> ProcessGroupMPI::alltoall_base(
